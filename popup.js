@@ -39,6 +39,107 @@ async function getTab() {
   return tab;
 }
 
+/* ---------- destination folder ---------- */
+const CFG_KEY = 'fetcherConfig';
+const loadCfg = () => { try { return JSON.parse(localStorage.getItem(CFG_KEY)) || {}; } catch (e) { return {}; } };
+const saveCfg = (c) => localStorage.setItem(CFG_KEY, JSON.stringify(c));
+
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('fetcher', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(k) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const q = db.transaction('kv').objectStore('kv').get(k);
+    q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
+  });
+}
+async function idbSet(k, v) { // v === undefined deletes
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const st = db.transaction('kv', 'readwrite');
+    const os = st.objectStore('kv');
+    v === undefined ? os.delete(k) : os.put(v, k);
+    st.oncomplete = res; st.onerror = () => rej(st.error);
+  });
+}
+
+function renderDest() {
+  $('destName').value = loadCfg().folderName || '';
+  $('clearDir').disabled = !loadCfg().folderName;
+}
+renderDest();
+
+$('pickDir').addEventListener('click', async () => {
+  // popups close when a native dialog opens, so do the picking in a normal tab
+  if (!new URLSearchParams(location.search).has('tab')) {
+    chrome.tabs.create({ url: chrome.runtime.getURL('popup.html?tab=1') });
+    return;
+  }
+  try {
+    const h = await showDirectoryPicker({ id: 'fetcher', mode: 'readwrite' });
+    await idbSet('dir', h);
+    saveCfg({ folderName: h.name });
+    renderDest();
+    setStatus('Saved. You can close this tab and use the popup.');
+  } catch (e) {
+    if (e.name !== 'AbortError') setStatus('Cannot use that folder: ' + e.message + ' (try a subfolder)');
+  }
+});
+
+$('clearDir').addEventListener('click', async () => {
+  await idbSet('dir', undefined);
+  saveCfg({});
+  renderDest();
+  setStatus('Reset: using Chrome default download folder.');
+});
+
+// Call at the START of a click handler (needs user gesture for permission prompt)
+async function getDestination() {
+  if (!loadCfg().folderName) return null;
+  try {
+    const h = await idbGet('dir');
+    if (!h) return null;
+    let p = await h.queryPermission({ mode: 'readwrite' });
+    if (p !== 'granted') p = await h.requestPermission({ mode: 'readwrite' });
+    if (p === 'granted') return h;
+    setStatus('Folder permission denied, using Chrome default.');
+  } catch (e) {}
+  return null;
+}
+
+async function uniqueName(dir, name) {
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : '';
+  let n = name, i = 2;
+  while (true) {
+    try { await dir.getFileHandle(n); n = `${base}_${i++}${ext}`; } // exists -> try next
+    catch (e) { return n; }
+  }
+}
+
+// returns the folder label actually used
+async function saveBlob(blob, name, dir) {
+  if (dir) {
+    try {
+      const finalName = await uniqueName(dir, name);
+      const fh = await dir.getFileHandle(finalName, { create: true });
+      const w = await fh.createWritable();
+      await w.write(blob); await w.close();
+      return { where: dir.name, name: finalName };
+    } catch (e) {
+      setStatus('Custom folder failed (' + e.message + '), using default.');
+    }
+  }
+  download(blob, name);
+  return { where: 'default Downloads', name };
+}
+
 /* ---------- in-page functions ---------- */
 function pageGetText() {
   return { url: location.href, text: document.body ? document.body.innerText : '' };
@@ -78,14 +179,15 @@ document.querySelectorAll('input[name=mode]').forEach((r) =>
 $('goText').addEventListener('click', async () => {
   $('goText').disabled = true;
   try {
+    const dir = await getDestination();          // <-- first, keeps the user gesture
     const tab = await getTab();
     if (!tab) return setStatus('This page cannot be accessed (e.g. chrome:// pages).');
     const [{ result }] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageGetText });
     const custom = $('filename').value.trim().replace(/\.txt$/i, '');
     const name = (custom ? sanitizeName(custom) : urlToFilename(result.url)) + '.txt';
     const content = `${result.url}\n\n${result.text}`; // original URL kept untouched inside the file
-    download(new Blob([content], { type: 'text/plain;charset=utf-8' }), name);
-    setStatus('Done: saved ' + name);
+    const r = await saveBlob(new Blob([content], { type: 'text/plain;charset=utf-8' }), name, dir);
+    setStatus(`Done: saved ${r.name} to ${r.where}`);
   } catch (e) {
     setStatus('Error: ' + e.message);
   } finally {
@@ -219,6 +321,7 @@ function imageFileName(url, ext, used) {
 $('goImages').addEventListener('click', async () => {
   $('goImages').disabled = true;
   try {
+    const dir = await getDestination();   // before the long download loop
     const lim = getLimits();
     const chosen = images.filter((im) => im.selected && passesFilter(im, lim));
     if (!chosen.length) return setStatus('No images selected.');
@@ -239,8 +342,8 @@ $('goImages').addEventListener('click', async () => {
     if (!ok) return setStatus('Could not download any images.');
     setStatus('Zipping...');
     const zipBlob = await zip.generateAsync({ type: 'blob' });
-    download(zipBlob, urlToFilename(currentTab.url) + '_imgs.zip');
-    setStatus(`Done: ${ok} images saved${fail ? `, ${fail} failed` : ''}.`);
+    const r = await saveBlob(zipBlob, urlToFilename(currentTab.url) + '_imgs.zip', dir);
+    setStatus(`Done: ${ok} images saved to ${r.where}${fail ? `, ${fail} failed` : ''}.`);
   } catch (e) {
     setStatus('Error: ' + e.message);
   } finally {
